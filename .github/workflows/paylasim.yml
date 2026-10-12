@@ -1,0 +1,48 @@
+name: paylasim
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * *'
+    - cron: '24 3 * * *'
+    - cron: '37 3 * * *'
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: paylasim
+  cancel-in-progress: false
+jobs:
+  paylas:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: github-pages
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: pip install --quiet cryptography
+      - id: hazirla
+        run: python yayinla.py hazirla
+        env:
+          KILIT: ${{ secrets.KILIT }}
+          GITHUB_TOKEN: ${{ github.token }}
+      - if: steps.hazirla.outputs.var == 'evet'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+      - if: steps.hazirla.outputs.var == 'evet'
+        id: site
+        uses: actions/deploy-pages@v5
+      - if: steps.hazirla.outputs.var == 'evet'
+        run: python yayinla.py paylas
+        env:
+          SITE: ${{ steps.site.outputs.page_url }}
+          KILIT: ${{ secrets.KILIT }}
+          GITHUB_TOKEN: ${{ github.token }}
+          IG_CINEPHON: ${{ secrets.IG_CINEPHON }}
+          IG_PARA_SAL: ${{ secrets.IG_PARA_SAL }}
+          IG_NEDEN_SEL: ${{ secrets.IG_NEDEN_SEL }}
+          IG_PAS_AJ: ${{ secrets.IG_PAS_AJ }}
