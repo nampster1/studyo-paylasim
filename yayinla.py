@@ -53,6 +53,21 @@ def coz(veri: bytes, anahtar: bytes | None = None) -> bytes:
     return AESGCM(anahtar or _anahtar()).decrypt(veri[:12], veri[12:], None)
 
 
+def paketle(veri: bytes, anahtar: bytes | None = None) -> bytes:
+    """Depodaki küçük dosyalar (kuyruk, durum) için: şifreli veri düz ASCII metin (base64) olarak yazılır. Neden: GitHub'ın dosya okuma ucu, metne
+    benzeyen küçük ikili dosyayı başka bir karakter kümesinden UTF-8'e ÇEVİREREK döndürüyor (12.10, ilk canlı çalışma: 30 baytlık durum dosyası
+    40 bayt geldi, açılamadı, paylaşım durdu). ASCII metin çevrilmez."""
+    return base64.b64encode(sifrele(veri, anahtar))
+
+
+def ac(ham: bytes, anahtar: bytes | None = None) -> bytes:
+    """paketle'nin tersi; eski (ham ikili) dosyayı da açar."""
+    try:
+        return coz(base64.b64decode(ham.strip(), validate=True), anahtar)
+    except Exception:                                              # noqa: BLE001 — base64 değil ya da eski biçim: ham dene (o da açılmazsa hata yükselir)
+        return coz(ham, anahtar)
+
+
 # ---------------------------------------------------------------- GitHub
 def _gh(yontem: str, yol: str, govde: dict | None = None, ham: bool = False, kabul: str | None = None):
     r = urllib.request.Request(yol if yol.startswith("http") else GH + yol, method=yontem,
@@ -103,13 +118,28 @@ def varliklar() -> dict:
 
 
 # ---------------------------------------------------------------- durum
+BOS_DURUM_BAYT = 80                    # bundan kısa bir durum dosyasında kayıt olamaz (tek kayıt bile daha uzundur)
+
+
+def durum_coz(ham: bytes | None, anahtar: bytes | None = None) -> dict:
+    """Durum dosyası → sözlük. Açılamayan dosya hata verir (paylaşılmış bir gönderiyi unutup yeniden paylaşmamak için); tek istisna, içinde kayıt
+    olamayacak kadar kısa dosyadır (12.10'da bozuk yazılan boş durum): boş sayılır."""
+    if not ham:
+        return {}
+    try:
+        return json.loads(ac(ham, anahtar).decode("utf-8"))
+    except Exception:                                              # noqa: BLE001
+        if len(ham) < BOS_DURUM_BAYT:
+            return {}
+        raise SystemExit("durum dosyası açılamadı")
+
+
 def durum_oku() -> dict:
-    ham, _ = dosya_oku(DURUM)
-    return json.loads(coz(ham).decode("utf-8")) if ham else {}
+    return durum_coz(dosya_oku(DURUM)[0])
 
 
 def durum_yaz(d: dict) -> None:
-    dosya_yaz(DURUM, sifrele(json.dumps(d, ensure_ascii=False).encode("utf-8")), "durum")
+    dosya_yaz(DURUM, paketle(json.dumps(d, ensure_ascii=False).encode("utf-8")), "durum")
 
 
 def _simdi() -> dt.datetime:
@@ -150,7 +180,7 @@ def hazirla() -> None:
     if not ham:
         print("kuyruk yok")
         return bildir(False)
-    kuyruk = json.loads(coz(ham).decode("utf-8"))
+    kuyruk = json.loads(ac(ham).decode("utf-8"))
     durum = durum_oku()
     once = json.dumps(durum, sort_keys=True)
     isler, durum = sirasi_gelenler(kuyruk, durum)
@@ -270,6 +300,7 @@ def paylas() -> None:
                     adres_bekle(taban.rstrip("/") + "/" + f["yol"])
                 durum[o["id"]] = {**kayit, "d": "kuru-tamam", "mesaj": ""}
                 print(f"{o['id']}: kuru deneme tamam")
+                durum_yaz(durum)
                 continue
             anahtar = os.environ.get("IG_" + o["kanal"].upper().replace("-", "_")) or ""
             if not anahtar:
