@@ -2,9 +2,9 @@ name: paylasim
 on:
   workflow_dispatch:
   schedule:
-    - cron: '17 3 * * *'
-    - cron: '24 3 * * *'
-    - cron: '37 3 * * *'
+    - cron: '30 17 * * *'
+    - cron: '37 17 * * *'
+    - cron: '50 17 * * *'
 permissions:
   contents: write
   pages: write
