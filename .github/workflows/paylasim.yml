@@ -43,3 +43,4 @@ jobs:
           KILIT: ${{ secrets.KILIT }}
           GITHUB_TOKEN: ${{ github.token }}
           IG_CINEPHON: ${{ secrets.IG_CINEPHON }}
+          IG_PARA_SAL: ${{ secrets.IG_PARA_SAL }}
