@@ -1,0 +1,308 @@
+"""Planlı paylaşım · Instagram (S17). Bu dosya GitHub'da, zamanlayıcının açtığı geçici bir bilgisayarda çalışır; stüdyo onu depoya kopyalar.
+
+Kanal sahibi (12.10): "b olsun… İkisi de tam otomatik olsun." Instagram "şu saatte yayınla" demeyi kabul etmiyor; saati gelince her zaman açık
+bir yerin paylaşması gerekiyor. O yer burası.
+
+İki adım (iş akışı sırayla çağırır):
+  hazirla  kuyruğu açar (şifreli), saati gelen gönderileri bulur, dosyalarını indirip açar ve `site/` klasörüne koyar. Instagram dosyayı
+           internetten çektiği için bu klasör birkaç dakikalığına herkese açık bir adreste yayınlanır (GitHub Pages; rastgele adlı klasör).
+  paylas   adresler açılınca Instagram'a gönderir (tek fotoğraf · kaydırmalı · Reels), sonucu durum dosyasına (şifreli) yazar.
+
+Güvenlik: paylaşım anahtarları ve şifre yalnız ortam değişkeninden okunur, hiçbir yere yazılmaz ve basılmaz. Günlük herkese açık olduğu için
+yalnız rastgele kimlikler ve durum sözcükleri basılır; açıklama, kanal adı, adres basılmaz. Çift paylaşımı önlemek için "yayınla" çağrısından
+hemen önce durum `yayinlaniyor` diye kaydedilir: o noktadan sonra yarıda kalan gönderi yeniden DENENMEZ, stüdyoda "kontrol et" diye görünür.
+"""
+import base64
+import datetime as dt
+import json
+import os
+import secrets
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+GH = "https://api.github.com"
+IG = "https://graph.instagram.com"
+KUYRUK, DURUM, SURUM_ETIKETI = "kuyruk.enc", "durum.enc", "kuyruk"
+ERKEN_SN = 90                          # zamanlayıcı birkaç saniye erken tetiklerse de paylaş
+GEC_SAAT = 6                           # bu kadar geciken gönderi artık paylaşılmaz ("kaçtı"; stüdyo yeniden planlatır)
+DENEME_EN_COK = 3
+BEKLE_SN = {"REELS": 420, "KAYDIRMALI": 180, "TEK": 120}
+IS = Path("_is.json")                  # iki adım arasında, yalnız bu geçici bilgisayarın diskinde
+
+
+# ---------------------------------------------------------------- şifre
+def _anahtar() -> bytes:
+    k = base64.b64decode(os.environ["KILIT"])
+    if len(k) != 32:
+        raise SystemExit("şifre anahtarı geçersiz")
+    return k
+
+
+def sifrele(veri: bytes, anahtar: bytes | None = None) -> bytes:
+    n = secrets.token_bytes(12)
+    return n + AESGCM(anahtar or _anahtar()).encrypt(n, veri, None)
+
+
+def coz(veri: bytes, anahtar: bytes | None = None) -> bytes:
+    return AESGCM(anahtar or _anahtar()).decrypt(veri[:12], veri[12:], None)
+
+
+# ---------------------------------------------------------------- GitHub
+def _gh(yontem: str, yol: str, govde: dict | None = None, ham: bool = False, kabul: str | None = None):
+    r = urllib.request.Request(yol if yol.startswith("http") else GH + yol, method=yontem,
+                               data=None if govde is None else json.dumps(govde).encode("utf-8"),
+                               headers={"Accept": kabul or "application/vnd.github+json", "User-Agent": "studyo-paylasim", "X-GitHub-Api-Version": "2022-11-28"})
+    r.add_unredirected_header("Authorization", f"Bearer {os.environ['GITHUB_TOKEN']}")      # dosya indirme başka sunucuya yönlenir: anahtar oraya gitmez
+    try:
+        with urllib.request.urlopen(r, timeout=300) as y:
+            b = y.read()
+    except urllib.error.HTTPError as h:
+        if h.code == 404:
+            return None
+        raise SystemExit(f"GitHub {yontem} {h.code}")
+    return b if ham else (json.loads(b.decode("utf-8")) if b.strip() else {})
+
+
+def _depo() -> str:
+    return os.environ["GITHUB_REPOSITORY"]
+
+
+def dosya_oku(ad: str) -> tuple[bytes | None, str | None]:
+    v = _gh("GET", f"/repos/{_depo()}/contents/{ad}")
+    if not v:
+        return None, None
+    ham = base64.b64decode(v["content"]) if v.get("content") else _gh("GET", v["download_url"], ham=True)
+    return ham, v["sha"]
+
+
+def dosya_yaz(ad: str, veri: bytes, mesaj: str) -> None:
+    for _ in range(4):                                             # stüdyo aynı anda başka dosya yazmış olabilir: sürümü yeniden oku
+        _, sha = dosya_oku(ad)
+        govde = {"message": mesaj, "content": base64.b64encode(veri).decode("ascii"), **({"sha": sha} if sha else {})}
+        r = urllib.request.Request(f"{GH}/repos/{_depo()}/contents/{ad}", method="PUT", data=json.dumps(govde).encode("utf-8"),
+                                   headers={"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}", "Accept": "application/vnd.github+json", "User-Agent": "studyo-paylasim"})
+        try:
+            urllib.request.urlopen(r, timeout=120).read()
+            return
+        except urllib.error.HTTPError as h:
+            if h.code not in (409, 422):
+                raise SystemExit(f"GitHub yazma {h.code}")
+            time.sleep(2)
+    raise SystemExit("durum dosyası yazılamadı")
+
+
+def varliklar() -> dict:
+    s = _gh("GET", f"/repos/{_depo()}/releases/tags/{SURUM_ETIKETI}")
+    return {a["name"]: a for a in (s or {}).get("assets", [])}
+
+
+# ---------------------------------------------------------------- durum
+def durum_oku() -> dict:
+    ham, _ = dosya_oku(DURUM)
+    return json.loads(coz(ham).decode("utf-8")) if ham else {}
+
+
+def durum_yaz(d: dict) -> None:
+    dosya_yaz(DURUM, sifrele(json.dumps(d, ensure_ascii=False).encode("utf-8")), "durum")
+
+
+def _simdi() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _zaman(s: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def sirasi_gelenler(kuyruk: dict, durum: dict, simdi: dt.datetime | None = None) -> tuple[list[dict], dict]:
+    """(paylaşılacaklar, güncellenen durum). Paylaşılmış, yayınlanırken yarıda kalmış, üç kez denenmiş ya da çok gecikmiş gönderi alınmaz."""
+    simdi = simdi or _simdi()
+    out = []
+    for o in kuyruk.get("ogeler", []):
+        d = durum.get(o["id"]) or {}
+        if d.get("d") in ("paylasildi", "yayinlaniyor", "kacti", "kuru-tamam") or int(d.get("deneme") or 0) >= DENEME_EN_COK:
+            continue
+        z = _zaman(o["zaman"])
+        if z > simdi + dt.timedelta(seconds=ERKEN_SN):
+            continue
+        if simdi - z > dt.timedelta(hours=GEC_SAAT):
+            durum[o["id"]] = {**d, "d": "kacti", "zaman": simdi.isoformat(timespec="seconds"), "mesaj": f"{GEC_SAAT} saatten fazla gecikti; paylaşılmadı"}
+            continue
+        out.append(o)
+    return out, durum
+
+
+# ---------------------------------------------------------------- 1 · hazırla
+def hazirla() -> None:
+    cikti = os.environ.get("GITHUB_OUTPUT")
+
+    def bildir(var: bool) -> None:
+        if cikti:
+            with open(cikti, "a", encoding="utf-8") as f:
+                f.write(f"var={'evet' if var else 'hayir'}\n")
+    ham = Path(KUYRUK).read_bytes() if Path(KUYRUK).is_file() else None
+    if not ham:
+        print("kuyruk yok")
+        return bildir(False)
+    kuyruk = json.loads(coz(ham).decode("utf-8"))
+    durum = durum_oku()
+    once = json.dumps(durum, sort_keys=True)
+    isler, durum = sirasi_gelenler(kuyruk, durum)
+    if json.dumps(durum, sort_keys=True) != once:
+        durum_yaz(durum)
+    if not isler:
+        print(f"sırası gelen yok ({len(kuyruk.get('ogeler', []))} gönderi kuyrukta)")
+        return bildir(False)
+    V, site, klasor = varliklar(), Path("site"), secrets.token_urlsafe(18)
+    (site / klasor).mkdir(parents=True, exist_ok=True)
+    (site / "index.html").write_text("<!doctype html><title>.</title>", encoding="utf-8")
+    (site / ".nojekyll").write_text("", encoding="utf-8")
+    hazir = []
+    for o in isler:
+        eksik = [f["ad"] for f in o["dosyalar"] if f["ad"] not in V]
+        if eksik:
+            d = durum.get(o["id"]) or {}
+            durum[o["id"]] = {**d, "d": "hata", "deneme": int(d.get("deneme") or 0) + 1, "zaman": _simdi().isoformat(timespec="seconds"), "mesaj": "dosya depoda yok"}
+            print(f"{o['id']}: dosya yok")
+            continue
+        for n, f in enumerate(o["dosyalar"]):
+            sifreli = _gh("GET", f"/repos/{_depo()}/releases/assets/{V[f['ad']]['id']}", ham=True, kabul="application/octet-stream")
+            f["yol"] = f"{klasor}/{o['id']}-{n}.{f['uz']}"
+            (site / f["yol"]).write_bytes(coz(sifreli))
+        hazir.append(o)
+        print(f"{o['id']}: {len(o['dosyalar'])} dosya hazır")
+    durum_yaz(durum)
+    IS.write_text(json.dumps(hazir, ensure_ascii=False), encoding="utf-8")
+    bildir(bool(hazir))
+
+
+# ---------------------------------------------------------------- Instagram
+class IGHata(Exception):
+    pass
+
+
+def _ig(yontem: str, yol: str, alanlar: dict, anahtar: str) -> dict:
+    veri = urllib.parse.urlencode({**{a: d for a, d in alanlar.items() if d is not None}, "access_token": anahtar}).encode("utf-8")
+    r = urllib.request.Request(f"{IG}{yol}" + ("?" + veri.decode("ascii") if yontem == "GET" else ""), method=yontem, data=veri if yontem == "POST" else None,
+                               headers={"User-Agent": "studyo-paylasim"})
+    try:
+        with urllib.request.urlopen(r, timeout=120) as y:
+            return json.loads(y.read().decode("utf-8"))
+    except urllib.error.HTTPError as h:
+        try:
+            e = (json.loads(h.read().decode("utf-8")).get("error") or {})
+            mesaj = f"{e.get('code')}/{e.get('error_subcode')}: {str(e.get('error_user_msg') or e.get('message') or '')[:240]}"
+        except ValueError:
+            mesaj = f"HTTP {h.code}"
+        raise IGHata(mesaj.replace(anahtar, "•"))
+    except urllib.error.URLError:
+        raise IGHata("Instagram'a ulaşılamadı")
+
+
+def _bekle(kap: str, anahtar: str, sure: int) -> None:
+    son = time.time() + sure
+    while time.time() < son:
+        d = _ig("GET", f"/{kap}", {"fields": "status_code,status"}, anahtar)
+        if d.get("status_code") == "FINISHED":
+            return
+        if d.get("status_code") in ("ERROR", "EXPIRED"):
+            raise IGHata(f"Instagram dosyayı işleyemedi: {str(d.get('status') or d.get('status_code'))[:200]}")
+        time.sleep(6)
+    raise IGHata("Instagram dosyayı zamanında işlemedi")
+
+
+def adres_bekle(adres: str, sure: int = 240) -> None:
+    son = time.time() + sure
+    while time.time() < son:
+        try:
+            r = urllib.request.Request(adres, method="HEAD", headers={"User-Agent": "studyo-paylasim"})
+            with urllib.request.urlopen(r, timeout=30) as y:
+                if y.status == 200:
+                    return
+        except (urllib.error.HTTPError, urllib.error.URLError):
+            pass
+        time.sleep(5)
+    raise IGHata("dosyanın adresi açılmadı")
+
+
+def kapsayici(o: dict, taban: str, anahtar: str, kim: str) -> str:
+    """Gönderinin Instagram kapsayıcısını kurar ve işlenmesini bekler → yayınlanmaya hazır kapsayıcı kimliği. Bu noktaya kadar yeniden denemek güvenli."""
+    adres = lambda f: taban.rstrip("/") + "/" + f["yol"]              # noqa: E731
+    ortak = json.dumps(o.get("ortak")) if o.get("ortak") else None
+    for f in o["dosyalar"]:
+        adres_bekle(adres(f))
+    if o["tur"] == "REELS":
+        video = next(f for f in o["dosyalar"] if f["rol"] == "video")
+        kapak = next((f for f in o["dosyalar"] if f["rol"] == "kapak"), None)
+        k = _ig("POST", f"/{kim}/media", {"media_type": "REELS", "video_url": adres(video), "caption": o.get("aciklama") or "", "cover_url": adres(kapak) if kapak else None,
+                                          "share_to_feed": "true" if o.get("akista", True) else "false", "collaborators": ortak}, anahtar)["id"]
+    elif o["tur"] == "TEK":
+        k = _ig("POST", f"/{kim}/media", {"image_url": adres(o["dosyalar"][0]), "caption": o.get("aciklama") or "", "alt_text": o.get("alt") or None, "collaborators": ortak}, anahtar)["id"]
+    else:
+        cocuk = []
+        for f in o["dosyalar"]:
+            c = _ig("POST", f"/{kim}/media", {"image_url": adres(f), "is_carousel_item": "true"}, anahtar)["id"]
+            _bekle(c, anahtar, 120)
+            cocuk.append(c)
+        k = _ig("POST", f"/{kim}/media", {"media_type": "CAROUSEL", "children": ",".join(cocuk), "caption": o.get("aciklama") or "", "collaborators": ortak}, anahtar)["id"]
+    _bekle(k, anahtar, BEKLE_SN.get(o["tur"], 180))
+    return k
+
+
+# ---------------------------------------------------------------- 2 · paylaş
+def paylas() -> None:
+    isler = json.loads(IS.read_text(encoding="utf-8")) if IS.is_file() else []
+    taban = os.environ["SITE"]
+    durum = durum_oku()
+    hata = 0
+    for o in isler:
+        d = durum.get(o["id"]) or {}
+        kayit = {**d, "deneme": int(d.get("deneme") or 0) + 1, "zaman": _simdi().isoformat(timespec="seconds")}
+        try:
+            if o.get("kuru"):                                      # kuru deneme: Instagram'a gidilmez; yalnız dosyaların adresi açılıyor mu
+                for f in o["dosyalar"]:
+                    adres_bekle(taban.rstrip("/") + "/" + f["yol"])
+                durum[o["id"]] = {**kayit, "d": "kuru-tamam", "mesaj": ""}
+                print(f"{o['id']}: kuru deneme tamam")
+                continue
+            anahtar = os.environ.get("IG_" + o["kanal"].upper().replace("-", "_")) or ""
+            if not anahtar:
+                raise IGHata("bu kanalın Instagram anahtarı yok")
+            ben = _ig("GET", "/me", {"fields": "user_id,username"}, anahtar)
+            kim = str(ben.get("user_id") or ben.get("id"))
+            durum[o["id"]] = {**kayit, "d": "hazirlaniyor", "mesaj": ""}
+            k = kapsayici(o, taban, anahtar, kim)
+            durum[o["id"]] = {**kayit, "d": "yayinlaniyor", "mesaj": ""}
+            durum_yaz(durum)                                       # bu satırdan sonra yarıda kalan gönderi yeniden denenmez (çift paylaşım olmasın)
+            m = _ig("POST", f"/{kim}/media_publish", {"creation_id": k}, anahtar)["id"]
+            bag = ""
+            try:
+                bag = _ig("GET", f"/{m}", {"fields": "permalink"}, anahtar).get("permalink") or ""
+            except IGHata:
+                pass
+            durum[o["id"]] = {**kayit, "d": "paylasildi", "medya": m, "baglanti": bag, "mesaj": ""}
+            print(f"{o['id']}: paylaşıldı")
+        except IGHata as h:
+            hata += 1
+            onceki = (durum.get(o["id"]) or {}).get("d")
+            durum[o["id"]] = {**kayit, "d": "yayinlaniyor" if onceki == "yayinlaniyor" else "hata", "mesaj": str(h)[:300]}
+            print(f"{o['id']}: olmadı ({'yayın sırasında' if onceki == 'yayinlaniyor' else 'hazırlıkta'})")
+        durum_yaz(durum)
+    V = varliklar()                                                # paylaşılan gönderinin şifreli dosyaları depodan silinir
+    for o in isler:
+        if (durum.get(o["id"]) or {}).get("d") in ("paylasildi", "kuru-tamam"):
+            for f in o["dosyalar"]:
+                if f["ad"] in V:
+                    _gh("DELETE", f"/repos/{_depo()}/releases/assets/{V[f['ad']]['id']}")
+    if hata:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    {"hazirla": hazirla, "paylas": paylas}[sys.argv[1]]()
