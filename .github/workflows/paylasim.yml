@@ -3,8 +3,17 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '30 17 * * *'
-    - cron: '37 17 * * *'
+    - cron: '35 17 * * *'
+    - cron: '40 17 * * *'
+    - cron: '45 17 * * *'
     - cron: '50 17 * * *'
+    - cron: '55 17 * * *'
+    - cron: '0 18 * * *'
+    - cron: '5 18 * * *'
+    - cron: '10 18 * * *'
+    - cron: '15 18 * * *'
+    - cron: '20 18 * * *'
+    - cron: '25 18 * * *'
 permissions:
   contents: write
   pages: write
@@ -19,23 +28,25 @@ jobs:
     environment:
       name: github-pages
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: '3.12'
-      - run: pip install --quiet cryptography
+      - run: pip install --quiet cryptography==46.0.5
       - id: hazirla
         run: python yayinla.py hazirla
         env:
           KILIT: ${{ secrets.KILIT }}
           GITHUB_TOKEN: ${{ github.token }}
       - if: steps.hazirla.outputs.var == 'evet'
-        uses: actions/upload-pages-artifact@v5
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
         with:
           path: site
       - if: steps.hazirla.outputs.var == 'evet'
         id: site
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346
       - if: steps.hazirla.outputs.var == 'evet'
         run: python yayinla.py paylas
         env:
@@ -45,3 +56,14 @@ jobs:
           IG_CINEPHON: ${{ secrets.IG_CINEPHON }}
           IG_PARA_SAL: ${{ secrets.IG_PARA_SAL }}
           IG_PAS_AJ: ${{ secrets.IG_PAS_AJ }}
+      - if: always() && steps.hazirla.outputs.var == 'evet'
+        run: rm -rf site _is.json && mkdir site && echo '<!doctype html><title>.</title>' > site/index.html
+      - if: always() && steps.hazirla.outputs.var == 'evet'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
+        with:
+          path: site
+          name: bos
+      - if: always() && steps.hazirla.outputs.var == 'evet'
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346
+        with:
+          artifact_name: bos
