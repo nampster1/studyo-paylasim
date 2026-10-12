@@ -44,3 +44,4 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           IG_CINEPHON: ${{ secrets.IG_CINEPHON }}
           IG_PARA_SAL: ${{ secrets.IG_PARA_SAL }}
+          IG_PAS_AJ: ${{ secrets.IG_PAS_AJ }}
