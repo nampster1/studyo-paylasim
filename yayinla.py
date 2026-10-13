@@ -32,6 +32,7 @@ KUYRUK, DURUM, SURUM_ETIKETI = "kuyruk.enc", "durum.enc", "kuyruk"
 ERKEN_SN = 90                          # zamanlayıcı birkaç saniye erken tetiklerse de paylaş
 GEC_SAAT = 6                           # bu kadar geciken gönderi artık paylaşılmaz ("kaçtı"; stüdyo yeniden planlatır)
 DENEME_EN_COK = 3
+TEKRAR_DK = 4                          # olmayan deneme bu kadar dakika geçmeden yinelenmez (geciken tetiklemeler art arda gelince üç hak yarım dakikada bitmesin; 13.10)
 BEKLE_SN = {"REELS": 420, "KAYDIRMALI": 180, "TEK": 120}
 IS = Path("_is.json")                  # iki adım arasında, yalnız bu geçici bilgisayarın diskinde
 
@@ -164,6 +165,12 @@ def sirasi_gelenler(kuyruk: dict, durum: dict, simdi: dt.datetime | None = None)
         if simdi - z > dt.timedelta(hours=GEC_SAAT):
             durum[o["id"]] = {**d, "d": "kacti", "zaman": simdi.isoformat(timespec="seconds"), "mesaj": f"{GEC_SAAT} saatten fazla gecikti; paylaşılmadı"}
             continue
+        if d.get("d") == "hata" and d.get("zaman"):                # az önce denendi ve olmadı: hemen yinelenmez
+            try:
+                if dt.timedelta(0) <= simdi - _zaman(d["zaman"]) < dt.timedelta(minutes=TEKRAR_DK):
+                    continue
+            except (ValueError, TypeError):
+                pass
         out.append(o)
     return out, durum
 
@@ -217,6 +224,12 @@ class IGHata(Exception):
     pass
 
 
+# Paylaşımın adımları: olmayan denemenin NEREDE kaldığı sonuca yazılır (13.10: üç Reels "API access blocked" ile döndü; hangi çağrıda olduğu
+# kayıtta yoktu). Günlüğe de yalnız bu sabit sözler basılır.
+ADIM_HESAP, ADIM_ADRES, ADIM_VER, ADIM_ISLE, ADIM_YAYIN = ("hesap okunurken", "dosyanın adresi beklenirken", "Instagram'a verilirken",
+                                                           "Instagram dosyayı işlerken", "yayınlanırken")
+
+
 def _ig(yontem: str, yol: str, alanlar: dict, anahtar: str) -> dict:
     veri = urllib.parse.urlencode({**{a: d for a, d in alanlar.items() if d is not None}, "access_token": anahtar}).encode("utf-8")
     r = urllib.request.Request(f"{IG}{yol}" + ("?" + veri.decode("ascii") if yontem == "GET" else ""), method=yontem, data=veri if yontem == "POST" else None,
@@ -261,12 +274,16 @@ def adres_bekle(adres: str, sure: int = 240) -> None:
     raise IGHata("dosyanın adresi açılmadı")
 
 
-def kapsayici(o: dict, taban: str, anahtar: str, kim: str) -> str:
-    """Gönderinin Instagram kapsayıcısını kurar ve işlenmesini bekler → yayınlanmaya hazır kapsayıcı kimliği. Bu noktaya kadar yeniden denemek güvenli."""
+def kapsayici(o: dict, taban: str, anahtar: str, kim: str, adim: dict | None = None) -> str:
+    """Gönderinin Instagram kapsayıcısını kurar ve işlenmesini bekler → yayınlanmaya hazır kapsayıcı kimliği. Bu noktaya kadar yeniden denemek güvenli.
+    adim["ad"]: o an yapılan iş (hata olursa nerede olduğu sonuca yazılır)."""
+    adim = adim if adim is not None else {}
     adres = lambda f: taban.rstrip("/") + "/" + f["yol"]              # noqa: E731
     ortak = json.dumps(o.get("ortak")) if o.get("ortak") else None
+    adim["ad"] = ADIM_ADRES
     for f in o["dosyalar"]:
         adres_bekle(adres(f))
+    adim["ad"] = ADIM_VER
     if o["tur"] == "REELS":
         video = next(f for f in o["dosyalar"] if f["rol"] == "video")
         kapak = next((f for f in o["dosyalar"] if f["rol"] == "kapak"), None)
@@ -281,6 +298,7 @@ def kapsayici(o: dict, taban: str, anahtar: str, kim: str) -> str:
             _bekle(c, anahtar, 120)
             cocuk.append(c)
         k = _ig("POST", f"/{kim}/media", {"media_type": "CAROUSEL", "children": ",".join(cocuk), "caption": o.get("aciklama") or "", "collaborators": ortak}, anahtar)["id"]
+    adim["ad"] = ADIM_ISLE
     _bekle(k, anahtar, BEKLE_SN.get(o["tur"], 180))
     return k
 
@@ -294,12 +312,13 @@ def paylas() -> None:
     for o in isler:
         d = durum.get(o["id"]) or {}
         kayit = {**d, "deneme": int(d.get("deneme") or 0) + 1, "zaman": _simdi().isoformat(timespec="seconds")}
+        adim = {"ad": ADIM_ADRES if o.get("kuru") else ADIM_HESAP}
         try:
             if o.get("kuru"):                                      # kuru deneme: Instagram'a gidilmez; yalnız dosyaların adresi açılıyor mu
                 for f in o["dosyalar"]:
                     adres_bekle(taban.rstrip("/") + "/" + f["yol"])
                 durum[o["id"]] = {**kayit, "d": "kuru-tamam", "mesaj": ""}
-                print(f"{o['id']}: kuru deneme tamam")
+                print(f"{o['id']}: kuru deneme tamam", flush=True)
                 durum_yaz(durum)
                 continue
             anahtar = os.environ.get("IG_" + o["kanal"].upper().replace("-", "_")) or ""
@@ -308,7 +327,8 @@ def paylas() -> None:
             ben = _ig("GET", "/me", {"fields": "user_id,username"}, anahtar)
             kim = str(ben.get("user_id") or ben.get("id"))
             durum[o["id"]] = {**kayit, "d": "hazirlaniyor", "mesaj": ""}
-            k = kapsayici(o, taban, anahtar, kim)
+            k = kapsayici(o, taban, anahtar, kim, adim)
+            adim["ad"] = ADIM_YAYIN
             durum[o["id"]] = {**kayit, "d": "yayinlaniyor", "mesaj": ""}
             durum_yaz(durum)                                       # bu satırdan sonra yarıda kalan gönderi yeniden denenmez (çift paylaşım olmasın)
             m = _ig("POST", f"/{kim}/media_publish", {"creation_id": k}, anahtar)["id"]
@@ -318,12 +338,12 @@ def paylas() -> None:
             except IGHata:
                 pass
             durum[o["id"]] = {**kayit, "d": "paylasildi", "medya": m, "baglanti": bag, "mesaj": ""}
-            print(f"{o['id']}: paylaşıldı")
+            print(f"{o['id']}: paylaşıldı", flush=True)
         except IGHata as h:
             hata += 1
             onceki = (durum.get(o["id"]) or {}).get("d")
-            durum[o["id"]] = {**kayit, "d": "yayinlaniyor" if onceki == "yayinlaniyor" else "hata", "mesaj": str(h)[:300]}
-            print(f"{o['id']}: olmadı ({'yayın sırasında' if onceki == 'yayinlaniyor' else 'hazırlıkta'})")
+            durum[o["id"]] = {**kayit, "d": "yayinlaniyor" if onceki == "yayinlaniyor" else "hata", "adim": adim["ad"], "mesaj": f"{adim['ad']} · {h}"[:300]}
+            print(f"{o['id']}: olmadı ({adim['ad']})", flush=True)  # sabit söz: içerik, açıklama, adres basılmaz
         durum_yaz(durum)
     V = varliklar()                                                # paylaşılan gönderinin şifreli dosyaları depodan silinir
     for o in isler:
