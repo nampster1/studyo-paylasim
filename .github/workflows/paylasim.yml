@@ -2,6 +2,18 @@ name: paylasim
 on:
   workflow_dispatch:
   schedule:
+    - cron: '59 0 * * *'
+    - cron: '4 1 * * *'
+    - cron: '9 1 * * *'
+    - cron: '14 1 * * *'
+    - cron: '19 1 * * *'
+    - cron: '24 1 * * *'
+    - cron: '29 1 * * *'
+    - cron: '34 1 * * *'
+    - cron: '39 1 * * *'
+    - cron: '44 1 * * *'
+    - cron: '49 1 * * *'
+    - cron: '54 1 * * *'
     - cron: '30 17 * * *'
     - cron: '35 17 * * *'
     - cron: '40 17 * * *'
