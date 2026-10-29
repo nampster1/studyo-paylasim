@@ -28,6 +28,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 GH = "https://api.github.com"
 IG = "https://graph.instagram.com"
+BUFFER = "https://api.buffer.com"      # TikTok (29.10): Buffer'ın GraphQL bağlantısı; anahtar "Authorization: Bearer …" başlığıyla (developers.buffer.com/guides/authentication)
+BUFFER_BEKLE_SN = 720                  # Buffer'ın videoyu çekip TikTok'a vermesi beklenir; bitmezse durum "yayinlaniyor" kalır, stüdyo Buffer'dan okur
 KUYRUK, DURUM, SURUM_ETIKETI = "kuyruk.enc", "durum.enc", "kuyruk"
 ERKEN_SN = 90                          # zamanlayıcı birkaç saniye erken tetiklerse de paylaş
 GEC_SAAT = 6                           # bu kadar geciken gönderi artık paylaşılmaz ("kaçtı"; stüdyo yeniden planlatır)
@@ -303,6 +305,124 @@ def kapsayici(o: dict, taban: str, anahtar: str, kim: str, adim: dict | None = N
     return k
 
 
+# ---------------------------------------------------------------- TikTok (Buffer üzerinden; 29.10)
+# Kanal sahibi (29.10): "tamam önerdiğin yolu yapalım. haftada 3 tane shorts yükleyeceğiz." TikTok kendi bağlantısıyla denetimsiz uygulamanın herkese
+# açık paylaşmasına izin vermiyor; Buffer TikTok'un onaylı ortağı. Buffer dosya almıyor, videoyu herkese açık bir adresten ÇEKİYOR ve belgesine göre
+# bunu PAYLAŞIM ANINDA yapıyor (developers.buffer.com/guides/hosting-media: "Buffer fetches the media when the post publishes"); aynı belge açılamayan
+# adresin gönderi kurulurken de hata verdiğini söylüyor. Video günlerce açık adreste durmasın diye Buffer'a önceden planlı gönderi KURULMAZ: saati
+# gelince bu yayıncı (Instagram'daki gibi) videoyu birkaç dakikalığına açar, Buffer'a "şimdi paylaş" (mode: shareNow) der, Buffer'ın işi bitirmesini
+# bekler, sonra adres kapanır. Zamanlama Buffer'da değil GitHub'da (bilgisayar kapalı olabilir).
+BF_OLUSTUR = """mutation Olustur($input: CreatePostInput!) {
+  createPost(input: $input) {
+    ... on PostActionSuccess { post { id status } }
+    ... on MutationError { message }
+  }
+}"""
+BF_GONDERI = """query Gonderi($input: PostInput!) {
+  post(input: $input) { id status dueAt sentAt externalLink error { message } }
+}"""
+BF_SIL = """mutation Sil($input: DeletePostInput!) {
+  deletePost(input: $input) {
+    ... on DeletePostSuccess { id }
+    ... on MutationError { message }
+  }
+}"""
+ADIM_BF_VER, ADIM_BF_ISLE = "Buffer'a verilirken", "Buffer TikTok'a gönderirken"
+
+
+class BFHata(Exception):
+    """kesin: Buffer'dan yanıt geldi ve gönderi KURULMADI (yeniden denemek güvenli). kesin değil: yanıt alınamadı (kurulmuş olabilir)."""
+    def __init__(self, mesaj: str, kesin: bool = True):
+        super().__init__(mesaj)
+        self.kesin = kesin
+
+
+def bf(sorgu: str, degisken: dict, anahtar: str) -> dict:
+    """Buffer GraphQL çağrısı → data. GraphQL her zaman HTTP 200 döner; hata gövdedeki "errors" dizisindedir (guides/error-handling)."""
+    r = urllib.request.Request(BUFFER, method="POST", data=json.dumps({"query": sorgu, "variables": degisken}).encode("utf-8"),
+                               headers={"Content-Type": "application/json", "User-Agent": "studyo-paylasim"})
+    r.add_unredirected_header("Authorization", f"Bearer {anahtar}")
+    try:
+        with urllib.request.urlopen(r, timeout=120) as y:
+            v = json.loads(y.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as h:
+        raise BFHata(f"Buffer HTTP {h.code}", kesin=h.code in (400, 401, 403, 404, 429))
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        raise BFHata("Buffer'a ulaşılamadı", kesin=False)
+    if v.get("errors"):
+        e = v["errors"][0] if isinstance(v["errors"], list) and v["errors"] else {}
+        kod = ((e.get("extensions") or {}).get("code")) or ""
+        raise BFHata(f"{kod + ': ' if kod else ''}{str(e.get('message') or '')[:200]}".replace(anahtar, "•"))
+    return v.get("data") or {}
+
+
+def buffer_girdi(o: dict, video_url: str) -> dict:
+    """createPost'un girdisi (reference.html → CreatePostInput, VideoAssetInput, TikTokPostMetadataInput). needsApproval belgede zorunlu (Boolean!)
+    görünüyor, örnekler yazmıyor: açıkça false gönderilir."""
+    video: dict = {"url": video_url}
+    if o.get("kapak_ms"):
+        video["metadata"] = {"thumbnailOffset": int(o["kapak_ms"])}       # TikTok'ta kapak karesi (ms); verilmezse Buffer'ın varsayılanı
+    girdi = {"channelId": o["bf_kanal"], "text": o.get("aciklama") or "", "schedulingType": "automatic", "mode": "shareNow",
+             "needsApproval": False, "assets": [{"video": video}], "source": "studyo"}
+    if o.get("yz") is not None:
+        girdi["metadata"] = {"tiktok": {"isAiGenerated": bool(o["yz"])}}  # TikTok'un yapay zekâ etiketi (yalnız video)
+    return girdi
+
+
+def tiktok_paylas(o: dict, taban: str, durum: dict, kayit: dict) -> bool:
+    """Bir TikTok gönderisi. Dönen: olmadı mı. Durum her adımda yazılır; Buffer'a "şimdi paylaş" denmeden hemen önce `yayinlaniyor`: o andan sonra
+    yarıda kalan gönderi yeniden DENENMEZ (TikTok'ta iki kez çıkmasın), stüdyo sonucu Buffer'dan kendisi okur."""
+    adim = ADIM_ADRES
+    try:
+        anahtar = os.environ.get("BUFFER_" + o["kanal"].upper().replace("-", "_")) or ""
+        if not anahtar:
+            raise BFHata("bu kanalın Buffer anahtarı yok")
+        video = next(f for f in o["dosyalar"] if f["rol"] == "video")
+        adres = taban.rstrip("/") + "/" + video["yol"]
+        adres_bekle(adres)
+        adim = ADIM_BF_VER
+        durum[o["id"]] = {**kayit, "d": "yayinlaniyor", "mesaj": ""}
+        durum_yaz(durum)
+        v = (bf(BF_OLUSTUR, {"input": buffer_girdi(o, adres)}, anahtar).get("createPost")) or {}
+        if not (v.get("post") or {}).get("id"):
+            raise BFHata(str(v.get("message") or "Buffer gönderiyi kurmadı")[:240])
+        pid = v["post"]["id"]
+        durum[o["id"]] = {**kayit, "d": "yayinlaniyor", "buffer": pid, "mesaj": ""}
+        durum_yaz(durum)
+        adim, son, p = ADIM_BF_ISLE, time.time() + BUFFER_BEKLE_SN, {}
+        while time.time() < son:
+            time.sleep(15)
+            try:
+                p = bf(BF_GONDERI, {"input": {"id": pid}}, anahtar).get("post") or {}
+            except BFHata:
+                continue
+            if p.get("status") in ("sent", "error", "draft", "needs_approval"):
+                break
+        if p.get("status") == "sent":
+            durum[o["id"]] = {**kayit, "d": "paylasildi", "buffer": pid, "baglanti": p.get("externalLink") or "", "mesaj": ""}
+            print(f"{o['id']}: paylaşıldı", flush=True)
+            return False
+        if p.get("status") == "error":                                 # TikTok ya da Buffer geri çevirdi: kendiliğinden yinelenmez (yeni saat verilince yeniden)
+            durum[o["id"]] = {**kayit, "d": "hata", "deneme": DENEME_EN_COK, "buffer": pid, "adim": adim,
+                              "mesaj": f"{adim} · {str((p.get('error') or {}).get('message') or 'Buffer hata verdi')[:240]}"}
+        elif p.get("status") in ("draft", "needs_approval"):
+            durum[o["id"]] = {**kayit, "d": "hata", "deneme": DENEME_EN_COK, "buffer": pid, "adim": adim,
+                              "mesaj": f"{adim} · Buffer gönderiyi taslak / onay bekleyen olarak aldı; Buffer'da bak"}
+        else:                                                          # süre doldu: Buffer hâlâ çalışıyor olabilir; stüdyo sonucu Buffer'dan okur
+            durum[o["id"]] = {**kayit, "d": "yayinlaniyor", "buffer": pid, "adim": adim, "mesaj": f"{adim} · Buffer {BUFFER_BEKLE_SN // 60} dakikada bitirmedi"}
+        print(f"{o['id']}: olmadı ({adim})", flush=True)
+        return True
+    except BFHata as h:
+        kesin = h.kesin or adim == ADIM_ADRES
+        durum[o["id"]] = {**kayit, "d": "hata" if kesin else "yayinlaniyor", "adim": adim, "mesaj": f"{adim} · {h}"[:300]}
+        print(f"{o['id']}: olmadı ({adim})", flush=True)
+        return True
+    except IGHata as h:                                                # adres_bekle: dosyanın adresi açılmadı
+        durum[o["id"]] = {**kayit, "d": "hata", "adim": adim, "mesaj": f"{adim} · {h}"[:300]}
+        print(f"{o['id']}: olmadı ({adim})", flush=True)
+        return True
+
+
 # ---------------------------------------------------------------- 2 · paylaş
 def paylas() -> None:
     isler = json.loads(IS.read_text(encoding="utf-8")) if IS.is_file() else []
@@ -312,6 +432,10 @@ def paylas() -> None:
     for o in isler:
         d = durum.get(o["id"]) or {}
         kayit = {**d, "deneme": int(d.get("deneme") or 0) + 1, "zaman": _simdi().isoformat(timespec="seconds")}
+        if o.get("tur") == "TIKTOK" and not o.get("kuru"):
+            hata += tiktok_paylas(o, taban, durum, kayit)
+            durum_yaz(durum)
+            continue
         adim = {"ad": ADIM_ADRES if o.get("kuru") else ADIM_HESAP}
         try:
             if o.get("kuru"):                                      # kuru deneme: Instagram'a gidilmez; yalnız dosyaların adresi açılıyor mu
