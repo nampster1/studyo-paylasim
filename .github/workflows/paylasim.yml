@@ -68,6 +68,7 @@ jobs:
           IG_CINEPHON: ${{ secrets.IG_CINEPHON }}
           IG_PARA_SAL: ${{ secrets.IG_PARA_SAL }}
           IG_PAS_AJ: ${{ secrets.IG_PAS_AJ }}
+          BUFFER_CINEPHON: ${{ secrets.BUFFER_CINEPHON }}
       - if: always() && steps.hazirla.outputs.var == 'evet'
         run: rm -rf site _is.json && mkdir site && echo '<!doctype html><title>.</title>' > site/index.html
       - if: always() && steps.hazirla.outputs.var == 'evet'
